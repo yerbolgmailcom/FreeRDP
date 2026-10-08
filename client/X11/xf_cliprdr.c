@@ -162,6 +162,7 @@ static const char type_FileGroupDescriptorW[] = "FileGroupDescriptorW";
 static const char type_HtmlFormat[] = "HTML Format";
 
 static void xf_cliprdr_clear_cached_data(xfClipboard* clipboard);
+static UINT xf_cliprdr_announce_client_formats(xfClipboard* clipboard);
 static UINT xf_cliprdr_send_client_format_list(xfClipboard* clipboard);
 static void xf_cliprdr_set_selection_owner(xfContext* xfc, xfClipboard* clipboard, Time timestamp);
 
@@ -1395,7 +1396,10 @@ static BOOL xf_cliprdr_process_selection_notify(xfClipboard* clipboard,
 	{
 		if (xevent->property == None)
 		{
-			xf_cliprdr_send_client_format_list(clipboard);
+			/* The owner refused TARGETS. Announce what we know, but do not request TARGETS
+			 * again: a refusing owner (e.g. XWayland while no X11 window has focus) would
+			 * answer the same way and the two sides would loop at full speed. */
+			xf_cliprdr_announce_client_formats(clipboard);
 		}
 		else
 		{
@@ -1984,12 +1988,9 @@ static UINT xf_cliprdr_send_client_capabilities(xfClipboard* clipboard)
  *
  * @return 0 on success, otherwise a Win32 error code
  */
-static UINT xf_cliprdr_send_client_format_list(xfClipboard* clipboard)
+static UINT xf_cliprdr_announce_client_formats(xfClipboard* clipboard)
 {
 	WINPR_ASSERT(clipboard);
-
-	xfContext* xfc = clipboard->xfc;
-	WINPR_ASSERT(xfc);
 
 	UINT32 numFormats = 0;
 	Atom* atoms = nullptr;
@@ -1999,6 +2000,20 @@ static UINT xf_cliprdr_send_client_format_list(xfClipboard* clipboard)
 
 	const UINT ret = xf_cliprdr_send_format_list(clipboard, formats, numFormats, atoms, atomsCount);
 
+	xf_cliprdr_free_formats(formats, numFormats);
+
+	return ret;
+}
+
+static UINT xf_cliprdr_send_client_format_list(xfClipboard* clipboard)
+{
+	WINPR_ASSERT(clipboard);
+
+	xfContext* xfc = clipboard->xfc;
+	WINPR_ASSERT(xfc);
+
+	const UINT ret = xf_cliprdr_announce_client_formats(clipboard);
+
 	if (clipboard->owner && clipboard->owner != xfc->drawable)
 	{
 		/* Request the owner for TARGETS, and wait for SelectionNotify event */
@@ -2006,8 +2021,6 @@ static UINT xf_cliprdr_send_client_format_list(xfClipboard* clipboard)
 		                           clipboard->targets[1], clipboard->property_atom, xfc->drawable,
 		                           CurrentTime);
 	}
-
-	xf_cliprdr_free_formats(formats, numFormats);
 
 	return ret;
 }
