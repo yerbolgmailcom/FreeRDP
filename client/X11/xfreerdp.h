@@ -204,6 +204,8 @@ struct xf_context
 	BOOL mouse_active;
 	BOOL fullscreen_toggle;
 	BOOL KeyboardState[256];
+	BOOL WindowsKeyDownDeferred[256];
+	BOOL WindowsKeyDownSent[256];
 	XModifierKeymap* modifierMap;
 	wArrayList* keyCombinations;
 	wArrayList* xevents;

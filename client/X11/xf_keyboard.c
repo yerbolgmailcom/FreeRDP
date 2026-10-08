@@ -517,6 +517,9 @@ BOOL xf_keyboard_update_modifier_map(xfContext* xfc)
 }
 
 static void xf_keyboard_send_key(xfContext* xfc, BOOL down, BOOL repeat, const XKeyEvent* ev);
+static DWORD get_rdp_scancode_from_x11_keycode(xfContext* xfc, DWORD keycode);
+static BOOL is_windows_key(DWORD scancode);
+static void xf_keyboard_send_deferred_windows_keys(xfContext* xfc);
 
 static BOOL xf_sync_kbd_state(xfContext* xfc)
 {
@@ -530,6 +533,8 @@ static void xf_keyboard_clear(xfContext* xfc)
 {
 	WINPR_ASSERT(xfc);
 	ZeroMemory(xfc->KeyboardState, sizeof(xfc->KeyboardState));
+	ZeroMemory(xfc->WindowsKeyDownDeferred, sizeof(xfc->WindowsKeyDownDeferred));
+	ZeroMemory(xfc->WindowsKeyDownSent, sizeof(xfc->WindowsKeyDownSent));
 }
 
 static BOOL xf_action_script_append(xfContext* xfc, const char* buffer, size_t size,
@@ -879,6 +884,20 @@ void xf_keyboard_key_press(xfContext* xfc, const XKeyEvent* event, KeySym keysym
 	if (xf_keyboard_handle_special_keys(xfc, keysym))
 		return;
 
+	const DWORD rdp_scancode = get_rdp_scancode_from_x11_keycode(xfc, event->keycode);
+	if (is_windows_key(rdp_scancode))
+	{
+		if (!last)
+		{
+			xfc->WindowsKeyDownDeferred[event->keycode] = TRUE;
+			xfc->WindowsKeyDownSent[event->keycode] = FALSE;
+		}
+		return;
+	}
+
+	/* Preserve remote Windows-key chords: once another key reaches FreeRDP,
+	 * send any deferred Windows-key press before forwarding that key. */
+	xf_keyboard_send_deferred_windows_keys(xfc);
 	xf_keyboard_send_key(xfc, TRUE, last, event);
 }
 
@@ -891,6 +910,29 @@ void xf_keyboard_key_release(xfContext* xfc, const XKeyEvent* event, KeySym keys
 	BOOL last = xfc->KeyboardState[event->keycode];
 	xfc->KeyboardState[event->keycode] = FALSE;
 	xf_keyboard_handle_special_keys_release(xfc, keysym);
+
+	const DWORD rdp_scancode = get_rdp_scancode_from_x11_keycode(xfc, event->keycode);
+	if (is_windows_key(rdp_scancode))
+	{
+		/* A Windows key pressed and released while RDP retained focus is a real
+		 * remote key tap.  If focus was gained with the key already held, there
+		 * is no deferred press and the unmatched release is discarded. */
+		if (last && xfc->WindowsKeyDownDeferred[event->keycode])
+		{
+			if (!xfc->WindowsKeyDownSent[event->keycode])
+			{
+				(void)freerdp_input_send_keyboard_event_ex(xfc->common.context.input, TRUE,
+				                                           FALSE, rdp_scancode);
+			}
+			(void)freerdp_input_send_keyboard_event_ex(xfc->common.context.input, FALSE, FALSE,
+			                                           rdp_scancode);
+		}
+
+		xfc->WindowsKeyDownDeferred[event->keycode] = FALSE;
+		xfc->WindowsKeyDownSent[event->keycode] = FALSE;
+		return;
+	}
+
 	xf_keyboard_send_key(xfc, FALSE, last, event);
 }
 
@@ -934,6 +976,32 @@ static DWORD get_rdp_scancode_from_x11_keycode(xfContext* xfc, DWORD keycode)
 	return scancode;
 }
 
+static BOOL is_windows_key(DWORD scancode)
+{
+	return (scancode == RDP_SCANCODE_LWIN) || (scancode == RDP_SCANCODE_RWIN);
+}
+
+static void xf_keyboard_send_deferred_windows_keys(xfContext* xfc)
+{
+	WINPR_ASSERT(xfc);
+
+	for (size_t keycode = 0; keycode < ARRAYSIZE(xfc->KeyboardState); keycode++)
+	{
+		if (!xfc->KeyboardState[keycode] || !xfc->WindowsKeyDownDeferred[keycode] ||
+		    xfc->WindowsKeyDownSent[keycode])
+			continue;
+
+		const DWORD rdp_scancode =
+		    get_rdp_scancode_from_x11_keycode(xfc, WINPR_ASSERTING_INT_CAST(UINT32, keycode));
+		if (!is_windows_key(rdp_scancode))
+			continue;
+
+		(void)freerdp_input_send_keyboard_event_ex(xfc->common.context.input, TRUE, FALSE,
+		                                           rdp_scancode);
+		xfc->WindowsKeyDownSent[keycode] = TRUE;
+	}
+}
+
 static BOOL isModifier(DWORD scancode)
 {
 	const DWORD modifiers[] = { RDP_SCANCODE_LWIN,  RDP_SCANCODE_RWIN,     RDP_SCANCODE_LMENU,
@@ -963,6 +1031,22 @@ static void release_keys(xfContext* xfc, BOOL modifiers)
 
 			if (isModifier(rdp_scancode) == modifiers)
 			{
+				if (is_windows_key(rdp_scancode))
+				{
+					/* If focus is lost before another key reaches FreeRDP, discard the
+					 * deferred Windows-key press.  Otherwise release the press that was
+					 * already sent as part of a remote Windows-key chord. */
+					if (xfc->WindowsKeyDownSent[keycode])
+					{
+						(void)freerdp_input_send_keyboard_event_ex(
+						    xfc->common.context.input, FALSE, FALSE, rdp_scancode);
+					}
+					xfc->WindowsKeyDownDeferred[keycode] = FALSE;
+					xfc->WindowsKeyDownSent[keycode] = FALSE;
+					xfc->KeyboardState[keycode] = FALSE;
+					continue;
+				}
+
 				(void)freerdp_input_send_keyboard_event_ex(xfc->common.context.input, FALSE, FALSE,
 				                                           rdp_scancode);
 				xfc->KeyboardState[keycode] = FALSE;
